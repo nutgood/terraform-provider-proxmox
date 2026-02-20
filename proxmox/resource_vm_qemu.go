@@ -772,7 +772,7 @@ func resourceVmQemuCreate(ctx context.Context, d *schema.ResourceData, meta inte
 
 	d.Set("reboot_required", rebootRequired)
 	log.Print("[DEBUG][QemuVmCreate] vm creation done!")
-	return append(diags, resourceVmQemuRead(ctx, d, vmr, client)...)
+	return append(diags, resourceVmQemuRead(ctx, d, vmr, client, true)...)
 }
 
 func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -934,7 +934,7 @@ func resourceVmQemuUpdate(ctx context.Context, d *schema.ResourceData, meta inte
 	}
 
 	reboot.SetRequired(rebootRequired, d)
-	return append(diags, resourceVmQemuRead(ctx, d, vmr, client)...)
+	return append(diags, resourceVmQemuRead(ctx, d, vmr, client, true)...)
 }
 
 func resourceVmQemuReadWithLock(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
@@ -974,10 +974,10 @@ func resourceVmQemuReadWithLock(ctx context.Context, d *schema.ResourceData, met
 	if err := client.CheckVmRef(ctx, vmr); err != nil {
 		return append(diags, diag.FromErr(err)...)
 	}
-	return append(diags, resourceVmQemuRead(ctx, d, vmr, client)...)
+	return append(diags, resourceVmQemuRead(ctx, d, vmr, client, false)...)
 }
 
-func resourceVmQemuRead(ctx context.Context, d *schema.ResourceData, vmr *pveSDK.VmRef, client *pveSDK.Client) diag.Diagnostics {
+func resourceVmQemuRead(ctx context.Context, d *schema.ResourceData, vmr *pveSDK.VmRef, client *pveSDK.Client, waitForAgent bool) diag.Diagnostics {
 
 	// create a logger for this function
 	var diags diag.Diagnostics
@@ -1014,7 +1014,7 @@ func resourceVmQemuRead(ctx context.Context, d *schema.ResourceData, vmr *pveSDK
 	if state == pveSDK.PowerStateRunning {
 		log.Printf("[DEBUG] VM is running, checking the IP")
 		// TODO when network interfaces are reimplemented check if we have an interface before getting the connection info
-		diags = append(diags, initConnInfo(ctx, d, client, vmr, config, ciDisk)...)
+		diags = append(diags, initConnInfo(ctx, d, client, vmr, config, ciDisk, waitForAgent)...)
 	} else {
 		// Optional convenience attributes for provisioners
 		err = d.Set("default_ipv4_address", nil)
@@ -1314,7 +1314,7 @@ func UpdateDevicesSet(
 	return devicesSet
 }
 
-func initConnInfo(ctx context.Context, d *schema.ResourceData, client *pveSDK.Client, vmr *pveSDK.VmRef, config *pveSDK.ConfigQemu, hasCiDisk bool) diag.Diagnostics {
+func initConnInfo(ctx context.Context, d *schema.ResourceData, client *pveSDK.Client, vmr *pveSDK.VmRef, config *pveSDK.ConfigQemu, hasCiDisk, waitForAgent bool) diag.Diagnostics {
 	logger, _ := CreateSubLogger("initConnInfo")
 	var diags diag.Diagnostics
 	// allow user to opt-out of setting the connection info for the resource
@@ -1342,12 +1342,16 @@ func initConnInfo(ctx context.Context, d *schema.ResourceData, client *pveSDK.Cl
 	log.Print("[INFO][initConnInfo] trying to get vm ip address for provisioner")
 	logger.Info().Int(vmID.Root, int(vmr.VmId())).Msgf("trying to get vm ip address for provisioner")
 
+	var agentTimeout time.Duration
+	if waitForAgent {
+		agentTimeout = time.Duration(d.Get(schemaAgentTimeout).(int)) * time.Second
+	}
 	IPs, agentDiags := getPrimaryIP(
 		ctx, client,
 		config.CloudInit,
 		config.Networks,
 		vmr,
-		time.Duration(d.Get(schemaAgentTimeout).(int))*time.Second,
+		agentTimeout,
 		time.Duration(d.Get(schemaAdditionalWait).(int))*time.Second,
 		ciAgentEnabled,
 		d.Get(schemaSkipIPv4).(bool),
@@ -1445,7 +1449,7 @@ func getPrimaryIP(
 	logger.Debug().Int(vmID.Root, int(vmr.VmId())).Msgf("retrying for at most  %v before giving up", retryDuration)
 	logger.Debug().Int(vmID.Root, int(vmr.VmId())).Msgf("retries will end at %s", endTime)
 	var state pveSDK.GuestAgentState
-	for time.Now().Before(endTime) {
+	for {
 		var interfaces pveSDK.RawAgentNetworkInterfaces
 		interfaces, state, err = vmr.GetAgentInformation(ctx, client)
 		if err != nil {
@@ -1465,6 +1469,9 @@ func getPrimaryIP(
 					return conn.IPs, diag.Diagnostics{}
 				}
 			}
+		}
+		if !time.Now().Before(endTime) {
+			break
 		}
 		time.Sleep(retryInterval)
 	}
